@@ -1,0 +1,33 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "productName": "CostToken",
+  "version": "0.1.0",
+  "identifier": "app.costtoken.desktop",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://127.0.0.1:5173",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
+  },
+  "app": {
+    "windows": [{
+      "title": "CostToken",
+      "width": 1320,
+      "height": 830,
+      "minWidth": 960,
+      "minHeight": 640,
+      "center": true,
+      "transparent": true,
+      "titleBarStyle": "Overlay",
+      "windowEffects": {
+        "effects": ["liquidGlassRegular", "sidebar"],
+        "interactive": true
+      }
+    }]
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app"],
+    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/icon.icns"]
+  }
+}

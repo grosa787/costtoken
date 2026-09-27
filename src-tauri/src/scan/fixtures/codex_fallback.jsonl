@@ -1,0 +1,2 @@
+{"timestamp":"2027-01-15T10:01:00Z","type":"turn_context","payload":{"model":"gpt-test"}}
+{"timestamp":"2027-01-15T10:02:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"cached_input_tokens":2,"cache_write_input_tokens":1,"output_tokens":3,"reasoning_output_tokens":1,"total_tokens":13},"total_token_usage":{"input_tokens":10,"cached_input_tokens":2,"cache_write_input_tokens":1,"output_tokens":3,"reasoning_output_tokens":1,"total_tokens":13}}}}
