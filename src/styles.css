@@ -209,6 +209,7 @@ h1 { font-size: 32px; letter-spacing: -.045em; font-weight: 620; }
 .lead-facts > div:last-child { border-bottom: 0; }
 .lead-facts span { color: #879cab; font-size: 10px; }
 .lead-facts strong { color: #dce6ec; font-size: 16px; font-weight: 600; letter-spacing: -.025em; font-variant-numeric: tabular-nums; }
+.time-method { margin-top: 7px; color: #718697; font-size: 9px; line-height: 1.4; }
 .flow-strip { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); margin: 0 0 20px; padding: 17px 0; border-bottom: 1px solid rgba(204, 222, 235, .12); }
 .flow-strip > div { display: grid; gap: 3px; min-width: 0; padding: 0 18px; border-right: 1px solid rgba(204, 222, 235, .10); }
 .flow-strip > div:first-child { padding-left: 0; }

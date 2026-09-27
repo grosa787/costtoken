@@ -1,0 +1,8 @@
+{"timestamp":"2027-01-15T10:00:00Z","type":"session_meta","payload":{"id":"session-a"}}
+{"timestamp":"2027-01-15T10:00:01Z","type":"response_item","payload":{"type":"message","role":"user","id":"user-a","content":[]}}
+{"timestamp":"2027-01-15T10:00:01Z","type":"response_item","payload":{"type":"message","role":"user","id":"user-a","content":[]}}
+{"timestamp":"2027-01-15T10:00:02Z","type":"compacted","payload":{"type":"message","role":"user","content":[]}}
+{"timestamp":"2027-01-15T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-direct","duration_ms":1500}}
+{"timestamp":"2027-01-15T10:01:00Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-paired"}}
+{"timestamp":"2027-01-15T10:01:10Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-paired"}}
+{"timestamp":"2027-01-15T10:02:00Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-invalid","duration_ms":0}}

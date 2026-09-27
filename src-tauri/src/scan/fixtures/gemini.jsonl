@@ -1,4 +1,6 @@
 {"sessionId":"session-1","projectHash":"project","startTime":"2027-01-15T10:00:00Z","lastUpdated":"2027-01-15T10:00:00Z"}
+{"id":"user-1","type":"user","timestamp":"2027-01-15T10:01:00Z","content":"redacted"}
+{"id":"user-1","type":"user","timestamp":"2027-01-15T10:02:00Z","content":"redacted"}
 {"id":"message-1","type":"gemini","timestamp":"2027-01-15T10:05:00Z","model":"gemini-test","tokens":{"input":10,"output":3,"cached":2,"thoughts":1,"tool":0,"total":14}}
 {"id":"message-1","type":"gemini","timestamp":"2027-01-15T10:06:00Z","model":"gemini-test","tokens":{"input":100,"output":30,"cached":25,"thoughts":8,"tool":5,"total":143}}
 {"id":"message-2","type":"gemini","timestamp":"2027-01-15T10:07:00Z","model":"gemini-test","tokens":{"input":20,"output":4,"cached":5,"thoughts":1,"tool":0,"total":25}}

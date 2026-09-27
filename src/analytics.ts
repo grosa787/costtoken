@@ -163,7 +163,7 @@ function subtractCalendarMonths(date: Date, months: number): Date {
   return result;
 }
 
-function periodStart(period: Exclude<Period, 'all'>, now: number): number {
+export function periodStart(period: Exclude<Period, 'all'>, now: number): number {
   const start = startOfLocalDay(now);
   switch (period) {
     case 'day':

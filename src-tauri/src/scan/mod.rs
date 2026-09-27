@@ -2,7 +2,7 @@ use chrono::{DateTime, Local, TimeZone};
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader};
@@ -17,6 +17,16 @@ pub struct ScanReport {
     pub buckets: Vec<UsageBucket>,
     pub sources: Vec<SourceStatus>,
     pub scanned_at: i64,
+    pub activity_intervals: Vec<ActivityInterval>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityInterval {
+    pub provider: String,
+    pub kind: String,
+    pub start: i64,
+    pub end: i64,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -103,7 +113,26 @@ struct FileSummary {
     buckets: BTreeMap<(i64, String), Counters>,
     event_count: u64,
     skipped_records: u64,
+    human_actions: Vec<RawHumanAction>,
+    human_action_keys: HashSet<(String, String)>,
+    agent_intervals: Vec<RawAgentInterval>,
 }
+
+#[derive(Clone, Debug)]
+struct RawHumanAction {
+    session: String,
+    key: String,
+    timestamp: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct RawAgentInterval {
+    start: i64,
+    end: i64,
+}
+
+const HUMAN_ACTION_GAP_SECONDS: i64 = 15 * 60;
+const MAX_AGENT_DURATION_MS: i64 = 24 * 60 * 60 * 1_000;
 
 impl FileSummary {
     fn add_event(&mut self, mut event: UsageEvent) {
@@ -124,6 +153,122 @@ impl FileSummary {
             .add(&event.counters);
         self.event_count = self.event_count.saturating_add(1);
     }
+
+    fn add_human_action(&mut self, session: &str, key: &str, timestamp: i64) {
+        if session.is_empty() || key.is_empty() {
+            return;
+        }
+        if !self
+            .human_action_keys
+            .insert((session.to_string(), key.to_string()))
+        {
+            return;
+        }
+        self.human_actions.push(RawHumanAction {
+            session: session.to_string(),
+            key: key.to_string(),
+            timestamp,
+        });
+    }
+
+    fn add_agent_interval_ms(&mut self, start_ms: i64, end_ms: i64) {
+        let duration_ms = end_ms.saturating_sub(start_ms);
+        if !(1..=MAX_AGENT_DURATION_MS).contains(&duration_ms) {
+            return;
+        }
+        let start = start_ms.div_euclid(1_000);
+        let end = end_ms.saturating_add(999).div_euclid(1_000);
+        if end > start {
+            self.agent_intervals.push(RawAgentInterval { start, end });
+        }
+    }
+
+    fn add_agent_duration_ms(&mut self, end_ms: i64, duration_ms: i64) {
+        if !(1..=MAX_AGENT_DURATION_MS).contains(&duration_ms) {
+            return;
+        }
+        self.add_agent_interval_ms(end_ms.saturating_sub(duration_ms), end_ms);
+    }
+}
+
+#[derive(Default)]
+struct SourceActivity {
+    human_actions: BTreeMap<(String, String), i64>,
+    agent_intervals: BTreeSet<RawAgentInterval>,
+}
+
+impl SourceActivity {
+    fn absorb(&mut self, summary: &FileSummary) {
+        for action in &summary.human_actions {
+            self.human_actions.insert(
+                (action.session.clone(), action.key.clone()),
+                action.timestamp,
+            );
+        }
+        self.agent_intervals
+            .extend(summary.agent_intervals.iter().copied());
+    }
+
+    #[cfg(test)]
+    fn add_human_action(&mut self, session: &str, key: &str, timestamp: i64) {
+        self.human_actions
+            .insert((session.to_string(), key.to_string()), timestamp);
+    }
+
+    fn into_intervals(self, provider: &str) -> Vec<ActivityInterval> {
+        let mut by_session = BTreeMap::<String, Vec<i64>>::new();
+        for ((session, _), timestamp) in self.human_actions {
+            by_session.entry(session).or_default().push(timestamp);
+        }
+
+        let mut intervals = Vec::new();
+        for timestamps in by_session.values_mut() {
+            timestamps.sort_unstable();
+            timestamps.dedup();
+            let Some(&first) = timestamps.first() else {
+                continue;
+            };
+            let mut cluster_start = first;
+            let mut cluster_end = first;
+            for &timestamp in timestamps.iter().skip(1) {
+                if timestamp.saturating_sub(cluster_end) <= HUMAN_ACTION_GAP_SECONDS {
+                    cluster_end = timestamp;
+                } else {
+                    intervals.push(human_interval(provider, cluster_start, cluster_end));
+                    cluster_start = timestamp;
+                    cluster_end = timestamp;
+                }
+            }
+            intervals.push(human_interval(provider, cluster_start, cluster_end));
+        }
+
+        intervals.extend(
+            self.agent_intervals
+                .into_iter()
+                .map(|interval| ActivityInterval {
+                    provider: provider.to_string(),
+                    kind: "agent".to_string(),
+                    start: interval.start,
+                    end: interval.end,
+                }),
+        );
+        intervals.sort_by(|left, right| {
+            left.start
+                .cmp(&right.start)
+                .then_with(|| left.end.cmp(&right.end))
+                .then_with(|| left.kind.cmp(&right.kind))
+        });
+        intervals
+    }
+}
+
+fn human_interval(provider: &str, first: i64, last: i64) -> ActivityInterval {
+    ActivityInterval {
+        provider: provider.to_string(),
+        kind: "human".to_string(),
+        start: first.saturating_sub(60),
+        end: last.saturating_add(120),
+    }
 }
 
 #[derive(Clone)]
@@ -140,7 +285,16 @@ struct CachedOpenCodeRow {
     version: i64,
     message_key: u64,
     event: Option<UsageEvent>,
+    human_action: Option<RawHumanAction>,
+    agent_interval: Option<RawAgentInterval>,
     skipped: bool,
+}
+
+#[derive(Default)]
+struct ParsedOpenCodeMessage {
+    event: Option<UsageEvent>,
+    human_action: Option<RawHumanAction>,
+    agent_interval: Option<RawAgentInterval>,
 }
 
 #[derive(Clone, Default)]
@@ -166,9 +320,11 @@ fn scan_usage_sync() -> Result<ScanReport, String> {
 
     let mut aggregate = BTreeMap::<AggregateKey, Counters>::new();
     let mut sources = Vec::new();
+    let mut activity_intervals = Vec::new();
 
     let claude_root = home.join(".claude/projects");
     let claude_files = discover_jsonl(&claude_root, None);
+    let mut claude_activity = SourceActivity::default();
     sources.push(scan_source(
         "claude",
         "Claude Code",
@@ -176,7 +332,15 @@ fn scan_usage_sync() -> Result<ScanReport, String> {
         claude_files,
         parse_claude_file,
         &mut aggregate,
+        &mut claude_activity,
     ));
+    let claude_history = home.join(".claude/history.jsonl");
+    if claude_history.is_file() {
+        if let Ok(summary) = cached_summary(&claude_history, parse_claude_history_file) {
+            claude_activity.absorb(&summary);
+        }
+    }
+    activity_intervals.extend(claude_activity.into_intervals("claude"));
 
     let codex_root = home.join(".codex");
     let mut codex_files = discover_jsonl(&codex_root.join("sessions"), None);
@@ -192,6 +356,7 @@ fn scan_usage_sync() -> Result<ScanReport, String> {
             .or_insert(path);
     }
     let codex_files = codex_rollouts.into_values().collect();
+    let mut codex_activity = SourceActivity::default();
     sources.push(scan_source(
         "codex",
         "Codex",
@@ -199,10 +364,13 @@ fn scan_usage_sync() -> Result<ScanReport, String> {
         codex_files,
         parse_codex_file,
         &mut aggregate,
+        &mut codex_activity,
     ));
+    activity_intervals.extend(codex_activity.into_intervals("codex"));
 
     let gemini_root = home.join(".gemini");
     let gemini_files = discover_gemini_files(&gemini_root.join("tmp"));
+    let mut gemini_activity = SourceActivity::default();
     sources.push(scan_source(
         "gemini",
         "Gemini CLI",
@@ -210,7 +378,9 @@ fn scan_usage_sync() -> Result<ScanReport, String> {
         gemini_files,
         parse_gemini_file,
         &mut aggregate,
+        &mut gemini_activity,
     ));
+    activity_intervals.extend(gemini_activity.into_intervals("gemini"));
 
     let grok_root = home.join(".grok");
     let grok_log = grok_root.join("logs/unified.jsonl");
@@ -219,6 +389,7 @@ fn scan_usage_sync() -> Result<ScanReport, String> {
     } else {
         Vec::new()
     };
+    let mut grok_activity = SourceActivity::default();
     sources.push(scan_source(
         "grok",
         "Grok",
@@ -226,7 +397,9 @@ fn scan_usage_sync() -> Result<ScanReport, String> {
         grok_files,
         parse_grok_file,
         &mut aggregate,
+        &mut grok_activity,
     ));
+    activity_intervals.extend(grok_activity.into_intervals("grok"));
 
     let app_support = home.join("Library/Application Support");
     let antigravity_paths = [
@@ -255,6 +428,7 @@ fn scan_usage_sync() -> Result<ScanReport, String> {
     } else {
         Vec::new()
     };
+    let mut opencode_activity = SourceActivity::default();
     sources.push(scan_source(
         "opencode",
         "OpenCode",
@@ -262,7 +436,9 @@ fn scan_usage_sync() -> Result<ScanReport, String> {
         opencode_files,
         parse_opencode_file,
         &mut aggregate,
+        &mut opencode_activity,
     ));
+    activity_intervals.extend(opencode_activity.into_intervals("opencode"));
 
     let localcode_root = home.join(".localcode");
     let localcode_db = localcode_root.join("sessions.db");
@@ -271,6 +447,7 @@ fn scan_usage_sync() -> Result<ScanReport, String> {
     } else {
         Vec::new()
     };
+    let mut localcode_activity = SourceActivity::default();
     sources.push(scan_source(
         "localcode",
         "LocalCode",
@@ -278,7 +455,9 @@ fn scan_usage_sync() -> Result<ScanReport, String> {
         localcode_files,
         parse_localcode_file,
         &mut aggregate,
+        &mut localcode_activity,
     ));
+    activity_intervals.extend(localcode_activity.into_intervals("localcode"));
 
     let cursor_paths = [home.join(".cursor"), app_support.join("Cursor")];
     let cursor_detected = cursor_paths.iter().any(|path| path.exists());
@@ -314,6 +493,7 @@ fn scan_usage_sync() -> Result<ScanReport, String> {
         buckets,
         sources,
         scanned_at: chrono::Utc::now().timestamp(),
+        activity_intervals,
     })
 }
 
@@ -324,6 +504,7 @@ fn scan_source(
     files: Vec<PathBuf>,
     parser: fn(&Path) -> Result<FileSummary, String>,
     aggregate: &mut BTreeMap<AggregateKey, Counters>,
+    activity: &mut SourceActivity,
 ) -> SourceStatus {
     if !detected {
         return absent_status(id, name);
@@ -337,6 +518,7 @@ fn scan_source(
     for path in files {
         match cached_summary(&path, parser) {
             Ok(summary) => {
+                activity.absorb(&summary);
                 event_count = event_count.saturating_add(summary.event_count);
                 skipped_records = skipped_records.saturating_add(summary.skipped_records);
                 for ((hour, model), counters) in summary.buckets {
@@ -472,6 +654,42 @@ fn parse_claude_file(path: &Path) -> Result<FileSummary, String> {
     parse_claude_reader(reader)
 }
 
+fn parse_claude_history_file(path: &Path) -> Result<FileSummary, String> {
+    let reader = BufReader::new(
+        File::open(path).map_err(|_| "Claude history file could not be opened".to_string())?,
+    );
+    parse_claude_history_reader(reader)
+}
+
+fn parse_claude_history_reader<R: BufRead>(reader: R) -> Result<FileSummary, String> {
+    let mut summary = FileSummary::default();
+    for line in reader.lines() {
+        let Ok(line) = line else {
+            summary.skipped_records += 1;
+            continue;
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            summary.skipped_records += 1;
+            continue;
+        };
+        let Some(session) = value
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .filter(|session| !session.is_empty())
+        else {
+            continue;
+        };
+        let Some(timestamp) = value.get("timestamp").and_then(timestamp_seconds) else {
+            continue;
+        };
+        summary.add_human_action(session, &format!("timestamp:{timestamp}"), timestamp);
+    }
+    Ok(summary)
+}
+
 fn parse_claude_reader<R: BufRead>(reader: R) -> Result<FileSummary, String> {
     let mut summary = FileSummary::default();
     let mut aliases = HashMap::<String, String>::new();
@@ -486,13 +704,25 @@ fn parse_claude_reader<R: BufRead>(reader: R) -> Result<FileSummary, String> {
         if line.trim().is_empty() {
             continue;
         }
-        if !line.contains("\"usage\"") || !line.contains("assistant") {
+        let is_duration_candidate = line.contains("\"subtype\":\"turn_duration\"");
+        if !is_duration_candidate && (!line.contains("\"usage\"") || !line.contains("assistant")) {
             continue;
         }
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
             summary.skipped_records += 1;
             continue;
         };
+        if value.get("type").and_then(Value::as_str) == Some("system")
+            && value.get("subtype").and_then(Value::as_str) == Some("turn_duration")
+        {
+            if let (Some(end_ms), Some(duration_ms)) = (
+                value.get("timestamp").and_then(timestamp_millis),
+                value.get("durationMs").and_then(Value::as_i64),
+            ) {
+                summary.add_agent_duration_ms(end_ms, duration_ms);
+            }
+            continue;
+        }
         if value.get("type").and_then(Value::as_str) != Some("assistant")
             && value.pointer("/message/role").and_then(Value::as_str) != Some("assistant")
         {
@@ -575,6 +805,9 @@ fn parse_codex_file(path: &Path) -> Result<FileSummary, String> {
 fn parse_codex_reader<R: BufRead>(reader: R) -> Result<FileSummary, String> {
     let mut summary = FileSummary::default();
     let mut model = "unknown".to_string();
+    let mut session_id = None::<String>;
+    let mut task_starts = HashMap::<String, i64>::new();
+    let mut task_completions = HashMap::<String, (i64, Option<i64>)>::new();
     let mut primary = HashMap::<String, UsageEvent>::new();
     let mut primary_idless = Vec::new();
     let mut fallback = Vec::new();
@@ -591,6 +824,10 @@ fn parse_codex_reader<R: BufRead>(reader: R) -> Result<FileSummary, String> {
         if !line.contains("token_usage_record")
             && !line.contains("token_count")
             && !line.contains("turn_context")
+            && !line.contains("session_meta")
+            && !line.contains("response_item")
+            && !line.contains("task_started")
+            && !line.contains("task_complete")
         {
             continue;
         }
@@ -600,6 +837,62 @@ fn parse_codex_reader<R: BufRead>(reader: R) -> Result<FileSummary, String> {
         };
         let record_type = value.get("type").and_then(Value::as_str);
         let payload_type = value.pointer("/payload/type").and_then(Value::as_str);
+
+        if record_type == Some("session_meta") {
+            session_id = value
+                .pointer("/payload/id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned);
+            continue;
+        }
+
+        if record_type == Some("response_item")
+            && payload_type == Some("message")
+            && value.pointer("/payload/role").and_then(Value::as_str) == Some("user")
+        {
+            if let (Some(session), Some(timestamp)) = (
+                session_id.as_deref(),
+                value.get("timestamp").and_then(timestamp_seconds),
+            ) {
+                let key = value
+                    .pointer("/payload/id")
+                    .or_else(|| value.get("id"))
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("timestamp:{timestamp}"));
+                summary.add_human_action(session, &key, timestamp);
+            }
+            continue;
+        }
+
+        if record_type == Some("event_msg")
+            && matches!(payload_type, Some("task_started" | "task_complete"))
+        {
+            let Some(timestamp_ms) = value.get("timestamp").and_then(timestamp_millis) else {
+                continue;
+            };
+            let turn_id = value
+                .pointer("/payload/turn_id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty());
+            if payload_type == Some("task_started") {
+                if let Some(turn_id) = turn_id {
+                    task_starts.insert(turn_id.to_string(), timestamp_ms);
+                }
+            } else {
+                let duration_ms = value
+                    .pointer("/payload/duration_ms")
+                    .and_then(Value::as_i64);
+                if let Some(turn_id) = turn_id {
+                    task_completions.insert(turn_id.to_string(), (timestamp_ms, duration_ms));
+                } else if let Some(duration_ms) = duration_ms {
+                    summary.add_agent_duration_ms(timestamp_ms, duration_ms);
+                }
+            }
+            continue;
+        }
 
         if record_type == Some("turn_context") {
             if let Some(next_model) = value.pointer("/payload/model").and_then(Value::as_str) {
@@ -646,6 +939,13 @@ fn parse_codex_reader<R: BufRead>(reader: R) -> Result<FileSummary, String> {
         };
     for event in events {
         summary.add_event(event);
+    }
+    for (turn_id, (end_ms, duration_ms)) in task_completions {
+        if duration_ms.is_some_and(|duration| (1..=MAX_AGENT_DURATION_MS).contains(&duration)) {
+            summary.add_agent_duration_ms(end_ms, duration_ms.unwrap_or_default());
+        } else if let Some(start_ms) = task_starts.get(&turn_id) {
+            summary.add_agent_interval_ms(*start_ms, end_ms);
+        }
     }
     Ok(summary)
 }
@@ -757,11 +1057,18 @@ fn parse_gemini_reader<R: std::io::Read>(reader: R) -> Result<FileSummary, Strin
         .or_else(|| value.get("lastUpdated").and_then(timestamp_hour));
     let mut events = HashMap::<String, UsageEvent>::new();
     let mut idless = Vec::new();
+    let session_id = value
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty());
 
     let Some(messages) = value.get("messages").and_then(Value::as_array) else {
         return Ok(summary);
     };
     for message in messages {
+        if let Some(session_id) = session_id {
+            replay_gemini_user_action(message, session_id, &mut summary);
+        }
         match gemini_event(message, session_time, None) {
             Some(event) => {
                 if let Some(id) = message
@@ -787,8 +1094,10 @@ fn parse_gemini_reader<R: std::io::Read>(reader: R) -> Result<FileSummary, Strin
 fn parse_gemini_jsonl_reader<R: BufRead>(reader: R) -> Result<FileSummary, String> {
     let mut summary = FileSummary::default();
     let mut session_time = None;
+    let mut session_id = None::<String>;
     let mut events = HashMap::<String, UsageEvent>::new();
     let mut idless = Vec::new();
+    let mut human_actions = HashMap::<String, i64>::new();
 
     for line in reader.lines() {
         let Ok(line) = line else {
@@ -803,6 +1112,12 @@ fn parse_gemini_jsonl_reader<R: BufRead>(reader: R) -> Result<FileSummary, Strin
             continue;
         };
         if let Some(update) = value.get("$set") {
+            session_id = update
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned)
+                .or(session_id);
             session_time = update
                 .get("startTime")
                 .and_then(timestamp_hour)
@@ -811,12 +1126,24 @@ fn parse_gemini_jsonl_reader<R: BufRead>(reader: R) -> Result<FileSummary, Strin
                 events.clear();
                 idless.clear();
                 for message in messages {
-                    replay_gemini_message(message, session_time, &mut events, &mut idless);
+                    replay_gemini_message(
+                        message,
+                        session_time,
+                        &mut events,
+                        &mut idless,
+                        &mut human_actions,
+                    );
                 }
             }
             continue;
         }
         if value.get("sessionId").is_some() && value.get("id").is_none() {
+            session_id = value
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned)
+                .or(session_id);
             session_time = value
                 .get("startTime")
                 .and_then(timestamp_hour)
@@ -824,11 +1151,22 @@ fn parse_gemini_jsonl_reader<R: BufRead>(reader: R) -> Result<FileSummary, Strin
                 .or(session_time);
             continue;
         }
-        replay_gemini_message(&value, session_time, &mut events, &mut idless);
+        replay_gemini_message(
+            &value,
+            session_time,
+            &mut events,
+            &mut idless,
+            &mut human_actions,
+        );
     }
 
     for event in events.into_values().chain(idless) {
         summary.add_event(event);
+    }
+    if let Some(session_id) = session_id {
+        for (key, timestamp) in human_actions {
+            summary.add_human_action(&session_id, &key, timestamp);
+        }
     }
     Ok(summary)
 }
@@ -838,7 +1176,19 @@ fn replay_gemini_message(
     session_time: Option<i64>,
     events: &mut HashMap<String, UsageEvent>,
     idless: &mut Vec<UsageEvent>,
+    human_actions: &mut HashMap<String, i64>,
 ) {
+    if message.get("type").and_then(Value::as_str) == Some("user") {
+        if let Some(timestamp) = message.get("timestamp").and_then(timestamp_seconds) {
+            let key = message
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("timestamp:{timestamp}"));
+            human_actions.entry(key).or_insert(timestamp);
+        }
+    }
     let id = message
         .get("id")
         .and_then(Value::as_str)
@@ -852,6 +1202,22 @@ fn replay_gemini_message(
     } else {
         idless.push(event);
     }
+}
+
+fn replay_gemini_user_action(message: &Value, session_id: &str, summary: &mut FileSummary) {
+    if message.get("type").and_then(Value::as_str) != Some("user") {
+        return;
+    }
+    let Some(timestamp) = message.get("timestamp").and_then(timestamp_seconds) else {
+        return;
+    };
+    let key = message
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("timestamp:{timestamp}"));
+    summary.add_human_action(session_id, &key, timestamp);
 }
 
 fn gemini_event(
@@ -912,7 +1278,11 @@ fn parse_grok_reader<R: BufRead>(reader: R) -> Result<FileSummary, String> {
         if line.trim().is_empty() {
             continue;
         }
-        if !line.contains("prompt_tokens") && !line.contains("current_model_id") {
+        if !line.contains("prompt_tokens")
+            && !line.contains("current_model_id")
+            && !line.contains("prompt_len")
+            && !line.contains("turn_elapsed_ms")
+        {
             continue;
         }
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
@@ -937,6 +1307,21 @@ fn parse_grok_reader<R: BufRead>(reader: R) -> Result<FileSummary, String> {
         let Some(ctx) = value.get("ctx") else {
             continue;
         };
+        if let (Some(sid), Some(timestamp), Some(timestamp_ms)) = (
+            sid.as_deref(),
+            value.get("ts").and_then(timestamp_seconds),
+            value.get("ts").and_then(timestamp_millis),
+        ) {
+            if ctx.get("kind").is_some()
+                && ctx.get("prompt_len").is_some_and(Value::is_number)
+                && ctx.get("remaining_in_queue").is_some_and(Value::is_number)
+            {
+                summary.add_human_action(sid, &format!("timestamp:{timestamp}"), timestamp);
+            }
+            if let Some(duration_ms) = ctx.get("turn_elapsed_ms").and_then(Value::as_i64) {
+                summary.add_agent_duration_ms(timestamp_ms, duration_ms);
+            }
+        }
         if ctx.get("prompt_tokens").is_none()
             && ctx.get("completion_tokens").is_none()
             && ctx.get("cached_prompt_tokens").is_none()
@@ -1042,35 +1427,44 @@ fn parse_opencode_file(path: &Path) -> Result<FileSummary, String> {
         .collect();
 
     let mut row_statement = connection
-        .prepare("SELECT id, time_created, data FROM message WHERE rowid = ?1")
+        .prepare("SELECT id, session_id, time_created, data FROM message WHERE rowid = ?1")
         .map_err(|_| "OpenCode message schema is unavailable".to_string())?;
     for (rowid, version) in changed {
         let result = row_statement.query_row([rowid], |row| {
             Ok((
                 row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
             ))
         });
         let cached = match result {
-            Ok((id, created_at, data)) => match parse_opencode_message(created_at, &data) {
-                Ok(event) => CachedOpenCodeRow {
-                    version,
-                    message_key: hash_identifier(&id),
-                    event,
-                    skipped: false,
-                },
-                Err(()) => CachedOpenCodeRow {
-                    version,
-                    message_key: hash_identifier(&id),
-                    event: None,
-                    skipped: true,
-                },
-            },
+            Ok((id, session_id, created_at, data)) => {
+                match parse_opencode_message(created_at, &session_id, hash_identifier(&id), &data) {
+                    Ok(parsed) => CachedOpenCodeRow {
+                        version,
+                        message_key: hash_identifier(&id),
+                        event: parsed.event,
+                        human_action: parsed.human_action,
+                        agent_interval: parsed.agent_interval,
+                        skipped: false,
+                    },
+                    Err(()) => CachedOpenCodeRow {
+                        version,
+                        message_key: hash_identifier(&id),
+                        event: None,
+                        human_action: None,
+                        agent_interval: None,
+                        skipped: true,
+                    },
+                }
+            }
             Err(_) => CachedOpenCodeRow {
                 version,
                 message_key: rowid as u64,
                 event: None,
+                human_action: None,
+                agent_interval: None,
                 skipped: true,
             },
         };
@@ -1090,6 +1484,12 @@ fn parse_opencode_file(path: &Path) -> Result<FileSummary, String> {
         if let Some(event) = &cached.event {
             summary.add_event(event.clone());
         }
+        if let Some(action) = &cached.human_action {
+            summary.add_human_action(&action.session, &action.key, action.timestamp);
+        }
+        if let Some(interval) = cached.agent_interval {
+            summary.agent_intervals.push(interval);
+        }
     }
     if let Ok(mut guard) = cache.lock() {
         guard.insert(path.to_path_buf(), row_cache);
@@ -1097,13 +1497,49 @@ fn parse_opencode_file(path: &Path) -> Result<FileSummary, String> {
     Ok(summary)
 }
 
-fn parse_opencode_message(created_at: i64, data: &str) -> Result<Option<UsageEvent>, ()> {
+fn parse_opencode_message(
+    created_at: i64,
+    session_id: &str,
+    message_key: u64,
+    data: &str,
+) -> Result<ParsedOpenCodeMessage, ()> {
     let value = serde_json::from_str::<Value>(data).map_err(|_| ())?;
-    if value.get("role").and_then(Value::as_str) != Some("assistant") {
-        return Ok(None);
+    let role = value.get("role").and_then(Value::as_str);
+    let mut parsed = ParsedOpenCodeMessage::default();
+    if role == Some("user") {
+        if let Some(timestamp) = value
+            .pointer("/time/created")
+            .and_then(timestamp_seconds)
+            .or_else(|| timestamp_seconds(&Value::from(created_at)))
+        {
+            parsed.human_action = Some(RawHumanAction {
+                session: session_id.to_string(),
+                key: format!("message:{message_key}"),
+                timestamp,
+            });
+        }
+        return Ok(parsed);
     }
+    if role != Some("assistant") {
+        return Ok(parsed);
+    }
+
+    if let (Some(start_ms), Some(end_ms)) = (
+        value.pointer("/time/created").and_then(timestamp_millis),
+        value.pointer("/time/completed").and_then(timestamp_millis),
+    ) {
+        let duration_ms = end_ms.saturating_sub(start_ms);
+        if (1..=MAX_AGENT_DURATION_MS).contains(&duration_ms) {
+            let start = start_ms.div_euclid(1_000);
+            let end = end_ms.saturating_add(999).div_euclid(1_000);
+            if end > start {
+                parsed.agent_interval = Some(RawAgentInterval { start, end });
+            }
+        }
+    }
+
     let Some(tokens) = value.get("tokens") else {
-        return Ok(None);
+        return Ok(parsed);
     };
     let hour = value
         .pointer("/time/completed")
@@ -1111,7 +1547,7 @@ fn parse_opencode_message(created_at: i64, data: &str) -> Result<Option<UsageEve
         .or_else(|| value.pointer("/time/created").and_then(timestamp_hour))
         .or_else(|| timestamp_hour(&Value::from(created_at)))
         .ok_or(())?;
-    Ok(Some(UsageEvent {
+    parsed.event = Some(UsageEvent {
         hour,
         model: string_at(&value, &["/model/modelID", "/modelID", "/model"]),
         counters: Counters {
@@ -1123,7 +1559,8 @@ fn parse_opencode_message(created_at: i64, data: &str) -> Result<Option<UsageEve
             cache_write1h_tokens: 0,
             reasoning_output_tokens: token(tokens.get("reasoning")),
         },
-    }))
+    });
+    Ok(parsed)
 }
 
 fn hash_identifier(value: &str) -> u64 {
@@ -1136,20 +1573,23 @@ fn parse_localcode_file(path: &Path) -> Result<FileSummary, String> {
     let connection = open_read_only_database(path, "LocalCode")?;
     let mut statement = connection
         .prepare(
-            "SELECT id, created_at, model, tokens_input, tokens_output, \
-             cached_input_tokens, cache_creation_tokens FROM messages",
+            "SELECT id, session_id, role, created_at, duration_ms, model, tokens_input, \
+             tokens_output, cached_input_tokens, cache_creation_tokens FROM messages",
         )
         .map_err(|_| "LocalCode message schema is unavailable".to_string())?;
     let rows = statement
         .query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                nonnegative_sql_token(row.get::<_, Option<i64>>(3)?),
-                nonnegative_sql_token(row.get::<_, Option<i64>>(4)?),
-                nonnegative_sql_token(row.get::<_, Option<i64>>(5)?),
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, Option<String>>(5)?,
                 nonnegative_sql_token(row.get::<_, Option<i64>>(6)?),
+                nonnegative_sql_token(row.get::<_, Option<i64>>(7)?),
+                nonnegative_sql_token(row.get::<_, Option<i64>>(8)?),
+                nonnegative_sql_token(row.get::<_, Option<i64>>(9)?),
             ))
         })
         .map_err(|_| "LocalCode messages could not be read".to_string())?;
@@ -1157,10 +1597,23 @@ fn parse_localcode_file(path: &Path) -> Result<FileSummary, String> {
     let mut seen = std::collections::HashSet::new();
 
     for row in rows {
-        let Ok((id, created_at, model, raw_input, output, cache_read, cache_write)) = row else {
+        let Ok((
+            id,
+            session_id,
+            role,
+            created_at,
+            duration_ms,
+            model,
+            raw_input,
+            output,
+            cache_read,
+            cache_write,
+        )) = row
+        else {
             summary.skipped_records += 1;
             continue;
         };
+        let message_key = hash_identifier(&id);
         if !seen.insert(id) {
             continue;
         }
@@ -1168,6 +1621,17 @@ fn parse_localcode_file(path: &Path) -> Result<FileSummary, String> {
             summary.skipped_records += 1;
             continue;
         };
+        if role == "user" {
+            if let Some(timestamp) = timestamp_seconds(&Value::from(created_at)) {
+                summary.add_human_action(&session_id, &format!("message:{message_key}"), timestamp);
+            }
+        } else if role == "assistant" {
+            if let (Some(start_ms), Some(duration_ms)) =
+                (timestamp_millis(&Value::from(created_at)), duration_ms)
+            {
+                summary.add_agent_interval_ms(start_ms, start_ms.saturating_add(duration_ms));
+            }
+        }
         summary.add_event(UsageEvent {
             hour,
             model: model
@@ -1207,17 +1671,7 @@ fn timestamp_key(value: Option<&Value>) -> String {
 }
 
 fn timestamp_hour(value: &Value) -> Option<i64> {
-    let seconds = match value {
-        Value::Number(number) => numeric_timestamp(number.as_i64()?),
-        Value::String(text) => {
-            if let Ok(number) = text.parse::<i64>() {
-                numeric_timestamp(number)
-            } else {
-                DateTime::parse_from_rfc3339(text).ok()?.timestamp()
-            }
-        }
-        _ => return None,
-    };
+    let seconds = timestamp_seconds(value)?;
     let offset = Local
         .timestamp_opt(seconds, 0)
         .single()
@@ -1225,18 +1679,36 @@ fn timestamp_hour(value: &Value) -> Option<i64> {
     Some(hour_boundary_with_offset(seconds, offset))
 }
 
+fn timestamp_seconds(value: &Value) -> Option<i64> {
+    Some(timestamp_millis(value)?.div_euclid(1_000))
+}
+
+fn timestamp_millis(value: &Value) -> Option<i64> {
+    match value {
+        Value::Number(number) => Some(numeric_timestamp_millis(number.as_i64()?)),
+        Value::String(text) => {
+            if let Ok(number) = text.parse::<i64>() {
+                Some(numeric_timestamp_millis(number))
+            } else {
+                Some(DateTime::parse_from_rfc3339(text).ok()?.timestamp_millis())
+            }
+        }
+        _ => None,
+    }
+}
+
 fn hour_boundary_with_offset(seconds: i64, offset_seconds: i32) -> i64 {
     (seconds + i64::from(offset_seconds)).div_euclid(3600) * 3600 - i64::from(offset_seconds)
 }
 
-fn numeric_timestamp(value: i64) -> i64 {
+fn numeric_timestamp_millis(value: i64) -> i64 {
     let magnitude = value.unsigned_abs();
     if magnitude >= 100_000_000_000_000 {
-        value / 1_000_000
-    } else if magnitude >= 100_000_000_000 {
         value / 1_000
-    } else {
+    } else if magnitude >= 100_000_000_000 {
         value
+    } else {
+        value.saturating_mul(1_000)
     }
 }
 
@@ -1371,6 +1843,99 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
+    fn clusters_human_actions_per_session_and_deduplicates_ids_and_timestamps() {
+        let mut activity = SourceActivity::default();
+        activity.add_human_action("session-a", "action-a", 1_000);
+        activity.add_human_action("session-a", "action-a", 1_000);
+        activity.add_human_action("session-a", "action-same-time", 1_000);
+        activity.add_human_action("session-a", "action-b", 1_900);
+        activity.add_human_action("session-a", "action-c", 2_801);
+        activity.add_human_action("session-b", "action-d", 4_000);
+
+        let intervals = activity.into_intervals("test");
+        assert_eq!(
+            intervals,
+            vec![
+                ActivityInterval {
+                    provider: "test".into(),
+                    kind: "human".into(),
+                    start: 940,
+                    end: 2_020,
+                },
+                ActivityInterval {
+                    provider: "test".into(),
+                    kind: "human".into(),
+                    start: 2_741,
+                    end: 2_921,
+                },
+                ActivityInterval {
+                    provider: "test".into(),
+                    kind: "human".into(),
+                    start: 3_940,
+                    end: 4_120,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn activity_interval_serializes_with_camel_case_report_field() {
+        let report = ScanReport {
+            buckets: Vec::new(),
+            sources: Vec::new(),
+            scanned_at: 1,
+            activity_intervals: vec![ActivityInterval {
+                provider: "claude".into(),
+                kind: "agent".into(),
+                start: 10,
+                end: 20,
+            }],
+        };
+        let value = serde_json::to_value(report).unwrap();
+        assert_eq!(value["activityIntervals"][0]["kind"], "agent");
+        assert!(value.get("activity_intervals").is_none());
+    }
+
+    #[test]
+    fn claude_reads_history_actions_and_valid_turn_durations() {
+        let history = parse_claude_history_reader(Cursor::new(include_str!(
+            "fixtures/claude_history_activity.jsonl"
+        )))
+        .unwrap();
+        assert_eq!(history.human_actions.len(), 3);
+
+        let transcript =
+            parse_claude_reader(Cursor::new(include_str!("fixtures/claude_activity.jsonl")))
+                .unwrap();
+        assert_eq!(transcript.agent_intervals.len(), 1);
+    }
+
+    #[test]
+    fn codex_excludes_compacted_users_and_supports_direct_and_paired_durations() {
+        let summary =
+            parse_codex_reader(Cursor::new(include_str!("fixtures/codex_activity.jsonl"))).unwrap();
+        assert_eq!(summary.human_actions.len(), 1);
+        assert_eq!(summary.agent_intervals.len(), 2);
+    }
+
+    #[test]
+    fn gemini_reads_user_actions_without_inventing_agent_duration() {
+        let summary =
+            parse_gemini_reader(Cursor::new(include_str!("fixtures/gemini_activity.json")))
+                .unwrap();
+        assert_eq!(summary.human_actions.len(), 1);
+        assert!(summary.agent_intervals.is_empty());
+    }
+
+    #[test]
+    fn grok_reads_prompt_enqueue_and_whole_turn_duration_only() {
+        let summary =
+            parse_grok_reader(Cursor::new(include_str!("fixtures/grok_activity.jsonl"))).unwrap();
+        assert_eq!(summary.human_actions.len(), 1);
+        assert_eq!(summary.agent_intervals.len(), 1);
+    }
+
+    #[test]
     fn claude_normalizes_disjoint_cache_and_deduplicates() {
         let summary =
             parse_claude_reader(Cursor::new(include_str!("fixtures/claude.jsonl"))).unwrap();
@@ -1460,11 +2025,26 @@ mod tests {
         let summary =
             parse_gemini_jsonl_reader(Cursor::new(include_str!("fixtures/gemini.jsonl"))).unwrap();
         assert_eq!(summary.event_count, 2);
+        assert_eq!(summary.human_actions.len(), 1);
+        assert_eq!(summary.human_actions[0].timestamp, 1_800_007_260);
         let counters = summary.buckets.values().next().unwrap();
         assert_eq!(counters.input_tokens, 95);
         assert_eq!(counters.cache_read_tokens, 30);
         assert_eq!(counters.output_tokens, 43);
         assert_eq!(counters.reasoning_output_tokens, 9);
+    }
+
+    #[test]
+    fn gemini_jsonl_rewind_preserves_historical_user_actions_only() {
+        let summary = parse_gemini_jsonl_reader(Cursor::new(include_str!(
+            "fixtures/gemini_rewind_activity.jsonl"
+        )))
+        .unwrap();
+        assert_eq!(summary.human_actions.len(), 2);
+        assert_eq!(summary.event_count, 1);
+        let counters = summary.buckets.values().next().unwrap();
+        assert_eq!(counters.input_tokens, 15);
+        assert_eq!(counters.output_tokens, 5);
     }
 
     #[test]
@@ -1538,15 +2118,16 @@ mod tests {
         let connection = Connection::open(&path).unwrap();
         connection
             .execute(
-                "CREATE TABLE message (id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)",
+                "CREATE TABLE message (id TEXT, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)",
                 [],
             )
             .unwrap();
         connection
             .execute(
-                "INSERT INTO message VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO message VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
                     "message-1",
+                    "session-a",
                     1_800_007_200_000_i64,
                     1_i64,
                     r#"{"role":"assistant","model":{"modelID":"open-test"},"tokens":{"input":10,"output":20,"reasoning":5,"cache":{"read":3,"write":2}},"time":{"completed":1800007200000}}"#
@@ -1567,9 +2148,10 @@ mod tests {
         let connection = Connection::open(&path).unwrap();
         connection
             .execute(
-                "INSERT INTO message VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO message VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
                     "message-2",
+                    "session-a",
                     1_800_007_300_000_i64,
                     2_i64,
                     r#"{"role":"assistant","model":{"modelID":"open-test"},"tokens":{"input":7,"output":4,"reasoning":1,"cache":{"read":0,"write":0}},"time":{"completed":1800007300000}}"#
@@ -1622,21 +2204,78 @@ mod tests {
     }
 
     #[test]
-    fn localcode_reads_normalized_message_columns() {
-        let path = temporary_database_path("localcode");
+    fn opencode_reads_user_actions_and_assistant_start_end() {
+        let path = temporary_database_path("opencode-activity");
         let connection = Connection::open(&path).unwrap();
         connection
             .execute(
-                "CREATE TABLE messages (id TEXT, created_at INTEGER, model TEXT, tokens_input INTEGER, tokens_output INTEGER, cached_input_tokens INTEGER, cache_creation_tokens INTEGER)",
+                "CREATE TABLE message (id TEXT, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)",
                 [],
             )
             .unwrap();
         connection
             .execute(
-                "INSERT INTO messages VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO message VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    "user-1",
+                    "session-a",
+                    1_800_000_000_000_i64,
+                    1_i64,
+                    r#"{"role":"user","time":{"created":1800000000000}}"#
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO message VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    "assistant-1",
+                    "session-a",
+                    1_800_000_001_000_i64,
+                    2_i64,
+                    r#"{"role":"assistant","time":{"created":1800000001000,"completed":1800000002500}}"#
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO message VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    "assistant-invalid",
+                    "session-a",
+                    1_800_000_003_000_i64,
+                    3_i64,
+                    r#"{"role":"assistant","time":{"created":1800000003000,"completed":1800086403001}}"#
+                ],
+            )
+            .unwrap();
+        drop(connection);
+
+        let summary = parse_opencode_file(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        assert_eq!(summary.human_actions.len(), 1);
+        assert_eq!(summary.agent_intervals.len(), 1);
+    }
+
+    #[test]
+    fn localcode_reads_normalized_message_columns() {
+        let path = temporary_database_path("localcode");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "CREATE TABLE messages (id TEXT, session_id TEXT, role TEXT, created_at INTEGER, duration_ms INTEGER, model TEXT, tokens_input INTEGER, tokens_output INTEGER, cached_input_tokens INTEGER, cache_creation_tokens INTEGER)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO messages VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     "message-1",
+                    "session-a",
+                    "assistant",
                     1_800_007_200_000_i64,
+                    1_000_i64,
                     "local-test",
                     20,
                     12,
@@ -1655,6 +2294,75 @@ mod tests {
         assert_eq!(counters.output_tokens, 12);
         assert_eq!(counters.cache_read_tokens, 5);
         assert_eq!(counters.cache_write_tokens, 4);
+    }
+
+    #[test]
+    fn localcode_reads_user_actions_and_valid_assistant_durations() {
+        let path = temporary_database_path("localcode-activity");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "CREATE TABLE messages (id TEXT, session_id TEXT, role TEXT, created_at INTEGER, duration_ms INTEGER, model TEXT, tokens_input INTEGER, tokens_output INTEGER, cached_input_tokens INTEGER, cache_creation_tokens INTEGER)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO messages VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    "user-1",
+                    "session-a",
+                    "user",
+                    1_800_000_000_000_i64,
+                    Option::<i64>::None,
+                    Option::<String>::None,
+                    Option::<i64>::None,
+                    Option::<i64>::None,
+                    Option::<i64>::None,
+                    Option::<i64>::None
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO messages VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    "assistant-1",
+                    "session-a",
+                    "assistant",
+                    1_800_000_001_000_i64,
+                    1_500_i64,
+                    "local-test",
+                    1_i64,
+                    1_i64,
+                    0_i64,
+                    0_i64
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO messages VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    "assistant-invalid",
+                    "session-a",
+                    "assistant",
+                    1_800_000_003_000_i64,
+                    0_i64,
+                    "local-test",
+                    0_i64,
+                    0_i64,
+                    0_i64,
+                    0_i64
+                ],
+            )
+            .unwrap();
+        drop(connection);
+
+        let summary = parse_localcode_file(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        assert_eq!(summary.human_actions.len(), 1);
+        assert_eq!(summary.agent_intervals.len(), 1);
     }
 
     fn temporary_database_path(label: &str) -> PathBuf {

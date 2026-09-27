@@ -1,0 +1,4 @@
+{"sessionId":"session-1","projectHash":"project","startTime":"2027-01-15T10:00:00Z","lastUpdated":"2027-01-15T10:00:00Z"}
+{"id":"user-before-rewind","type":"user","timestamp":"2027-01-15T10:01:00Z","content":"redacted"}
+{"id":"agent-before-rewind","type":"gemini","timestamp":"2027-01-15T10:02:00Z","model":"gemini-test","tokens":{"input":10,"output":3,"cached":2,"thoughts":1,"tool":0,"total":14}}
+{"$set":{"messages":[{"id":"user-after-rewind","type":"user","timestamp":"2027-01-15T10:10:00Z","content":"redacted"},{"id":"agent-after-rewind","type":"gemini","timestamp":"2027-01-15T10:11:00Z","model":"gemini-test","tokens":{"input":20,"output":4,"cached":5,"thoughts":1,"tool":0,"total":25}}]}}

@@ -6,6 +6,7 @@ import {
   RotateCcw, Search, Settings2, ShieldCheck, X,
 } from 'lucide-react';
 import { filterBuckets, makeChartPoints, summarize, type ChartPoint } from './analytics';
+import { formatDuration, summarizeActivity } from './activity';
 import { findRate } from './pricing';
 import type { ModelRate, Period, ProviderId, ScanReport, SourceStatus, UsageBucket } from './types';
 
@@ -182,6 +183,10 @@ export default function App() {
 
   const scoped = useMemo(() => filterBuckets(report?.buckets ?? [], period, provider, new Date()), [report, period, provider]);
   const summary = useMemo(() => report ? summarize(scoped, overrides) : emptySummary, [report, scoped, overrides]);
+  const timeSummary = useMemo(
+    () => summarizeActivity(report?.activityIntervals ?? [], period, provider, new Date()),
+    [report, period, provider],
+  );
   const points = useMemo(() => makeChartPoints(scoped, period, overrides), [scoped, period, overrides]);
   const tokenOnly = summary.unpricedModels.length > 0 && summary.estimatedCost === 0 && summary.totalTokens > 0;
   const sources = report?.sources ?? [];
@@ -272,8 +277,9 @@ export default function App() {
           </div>
           <div className="lead-facts">
             <div><span>Всего токенов</span><strong>{loading ? '—' : compact(summary.totalTokens)}</strong></div>
-            <div><span>Чтение кэша</span><strong>{loading ? '—' : compact(summary.cacheReadTokens)}</strong></div>
-            <div><span>Доля кэша во входе</span><strong>{loading ? '—' : `${Math.round(cacheShare || 0)}%`}</strong></div>
+            <div title="Оценка по вашим действиям в журналах: соседние действия с паузой до 15 минут образуют одну сессию."><span>Ваше время</span><strong>{loading ? '—' : timeSummary.hasHumanData ? formatDuration(timeSummary.humanSeconds) : '—'}</strong></div>
+            <div title="Длительность задач, записанная агентами. Может включать ожидание инструментов; перекрытия не суммируются."><span>Задачи агентов</span><strong>{loading ? '—' : timeSummary.hasAgentData ? formatDuration(timeSummary.agentSeconds) : '—'}</strong></div>
+            <small className="time-method">Время оценено по сохранившимся журналам.</small>
           </div>
         </section>
 

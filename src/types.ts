@@ -23,8 +23,16 @@ export interface SourceStatus {
 
 export interface ScanReport {
   buckets: UsageBucket[];
+  activityIntervals: ActivityInterval[];
   sources: SourceStatus[];
   scannedAt: number;
+}
+
+export interface ActivityInterval {
+  provider: ProviderId;
+  kind: 'human' | 'agent';
+  start: number;
+  end: number;
 }
 
 export type Period = 'day' | 'week' | 'month' | 'sixMonths' | 'year' | 'all';

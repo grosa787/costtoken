@@ -1,0 +1,5 @@
+{"ts":"2027-01-15T10:00:01Z","sid":"session-a","msg":"redacted","ctx":{"kind":"prompt","prompt_len":8,"remaining_in_queue":0}}
+{"ts":"2027-01-15T10:00:01Z","sid":"session-a","msg":"redacted","ctx":{"kind":"prompt","prompt_len":8,"remaining_in_queue":0}}
+{"ts":"2027-01-15T10:00:12Z","sid":"session-a","msg":"redacted","ctx":{"prompt_id":"opaque","ok":true,"pre_turn_ms":2,"turn_elapsed_ms":11000,"total_elapsed_ms":11002}}
+{"ts":"2027-01-15T10:00:13Z","sid":"session-a","msg":"redacted","ctx":{"model_elapsed_ms":1000,"prompt_tokens":1,"completion_tokens":1}}
+{"ts":"2027-01-16T10:00:13Z","sid":"session-a","msg":"redacted","ctx":{"prompt_id":"opaque-2","ok":true,"pre_turn_ms":2,"turn_elapsed_ms":86400001,"total_elapsed_ms":86400003}}

@@ -1,0 +1,1 @@
+{"sessionId":"session-a","startTime":"2027-01-15T10:00:00Z","lastUpdated":"2027-01-15T10:01:00Z","messages":[{"id":"user-a","type":"user","timestamp":"2027-01-15T10:00:01Z","content":"redacted"},{"id":"user-a","type":"user","timestamp":"2027-01-15T10:00:01Z","content":"redacted"},{"id":"agent-a","type":"gemini","timestamp":"2027-01-15T10:00:03Z","tokens":{"input":1,"output":1}}]}
