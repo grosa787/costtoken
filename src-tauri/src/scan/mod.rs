@@ -806,12 +806,13 @@ fn parse_codex_reader<R: BufRead>(reader: R) -> Result<FileSummary, String> {
     let mut summary = FileSummary::default();
     let mut model = "unknown".to_string();
     let mut session_id = None::<String>;
+    let mut first_session_meta_seen = false;
+    let mut is_forked_session = false;
     let mut task_starts = HashMap::<String, i64>::new();
     let mut task_completions = HashMap::<String, (i64, Option<i64>)>::new();
     let mut primary = HashMap::<String, UsageEvent>::new();
     let mut primary_idless = Vec::new();
-    let mut fallback = Vec::new();
-    let mut fallback_total = None::<CodexUsage>;
+    let mut fallback_snapshots = Vec::<CodexFallbackSnapshot>::new();
 
     for line in reader.lines() {
         let Ok(line) = line else {
@@ -839,6 +840,12 @@ fn parse_codex_reader<R: BufRead>(reader: R) -> Result<FileSummary, String> {
         let payload_type = value.pointer("/payload/type").and_then(Value::as_str);
 
         if record_type == Some("session_meta") {
+            if !first_session_meta_seen {
+                is_forked_session = value.pointer("/payload/source/subagent").is_some()
+                    || value.pointer("/payload/forked_from_id").is_some()
+                    || value.pointer("/payload/source/forked_from_id").is_some();
+                first_session_meta_seen = true;
+            }
             session_id = value
                 .pointer("/payload/id")
                 .and_then(Value::as_str)
@@ -921,24 +928,56 @@ fn parse_codex_reader<R: BufRead>(reader: R) -> Result<FileSummary, String> {
             }
         } else if record_type == Some("event_msg") && payload_type == Some("token_count") {
             if let Some(usage) = value.pointer("/payload/info/total_token_usage") {
-                let current = CodexUsage::from_value(usage);
-                let delta = current.delta_from(fallback_total.as_ref());
-                fallback_total = Some(current);
-                if !delta.is_zero() {
-                    fallback.push(delta.into_event(hour, model.clone()));
+                if let Some(second) = value.get("timestamp").and_then(timestamp_seconds) {
+                    fallback_snapshots.push(CodexFallbackSnapshot {
+                        second,
+                        hour,
+                        model: model.clone(),
+                        total: CodexUsage::from_value(usage),
+                        last: value
+                            .pointer("/payload/info/last_token_usage")
+                            .map(CodexUsage::from_value),
+                    });
                 }
             }
         }
     }
 
-    let events: Box<dyn Iterator<Item = UsageEvent>> =
-        if primary.is_empty() && primary_idless.is_empty() {
-            Box::new(fallback.into_iter())
+    if primary.is_empty() && primary_idless.is_empty() {
+        let replay_second = if is_forked_session
+            && fallback_snapshots.len() >= 2
+            && fallback_snapshots[0].second == fallback_snapshots[1].second
+        {
+            Some(fallback_snapshots[0].second)
         } else {
-            Box::new(primary.into_values().chain(primary_idless))
+            None
         };
-    for event in events {
-        summary.add_event(event);
+        let mut previous_total = None::<CodexUsage>;
+        for snapshot in fallback_snapshots {
+            let advanced = previous_total.as_ref().is_none_or(|previous| {
+                if snapshot.total.total != 0 || previous.total != 0 {
+                    snapshot.total.total != previous.total
+                } else {
+                    snapshot.total != *previous
+                }
+            });
+            let request_usage = if advanced {
+                snapshot
+                    .last
+                    .unwrap_or_else(|| snapshot.total.delta_from(previous_total.as_ref()))
+            } else {
+                CodexUsage::default()
+            };
+            previous_total = Some(snapshot.total);
+            if replay_second == Some(snapshot.second) || request_usage.is_zero() {
+                continue;
+            }
+            summary.add_event(request_usage.into_event(snapshot.hour, snapshot.model));
+        }
+    } else {
+        for event in primary.into_values().chain(primary_idless) {
+            summary.add_event(event);
+        }
     }
     for (turn_id, (end_ms, duration_ms)) in task_completions {
         if duration_ms.is_some_and(|duration| (1..=MAX_AGENT_DURATION_MS).contains(&duration)) {
@@ -950,7 +989,15 @@ fn parse_codex_reader<R: BufRead>(reader: R) -> Result<FileSummary, String> {
     Ok(summary)
 }
 
-#[derive(Clone, Debug, Default)]
+struct CodexFallbackSnapshot {
+    second: i64,
+    hour: i64,
+    model: String,
+    total: CodexUsage,
+    last: Option<CodexUsage>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct CodexUsage {
     input: u64,
     cache_read: u64,
@@ -1988,6 +2035,32 @@ mod tests {
         assert_eq!(counters.cache_read_tokens, 3);
         assert_eq!(counters.cache_write_tokens, 1);
         assert_eq!(counters.output_tokens, 5);
+    }
+
+    #[test]
+    fn codex_fallback_counts_last_request_not_inherited_first_cumulative_snapshot() {
+        let summary = parse_codex_reader(Cursor::new(include_str!(
+            "fixtures/codex_inherited_baseline.jsonl"
+        )))
+        .unwrap();
+        assert_eq!(summary.event_count, 2);
+        let counters = summary.buckets.values().next().unwrap();
+        assert_eq!(counters.input_tokens, 4);
+        assert_eq!(counters.cache_read_tokens, 16);
+        assert_eq!(counters.output_tokens, 2);
+    }
+
+    #[test]
+    fn codex_subagent_skips_same_second_parent_replay_but_counts_live_request() {
+        let summary = parse_codex_reader(Cursor::new(include_str!(
+            "fixtures/codex_subagent_replay.jsonl"
+        )))
+        .unwrap();
+        assert_eq!(summary.event_count, 1);
+        let counters = summary.buckets.values().next().unwrap();
+        assert_eq!(counters.input_tokens, 4);
+        assert_eq!(counters.cache_read_tokens, 16);
+        assert_eq!(counters.output_tokens, 2);
     }
 
     #[test]
